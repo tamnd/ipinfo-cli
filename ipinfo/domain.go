@@ -2,34 +2,18 @@ package ipinfo
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes ipinfo as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/ipinfo-cli/ipinfo"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// ipinfo:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone ipinfo binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the ipinfo driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the ipinfo driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hostnames, and binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "ipinfo",
@@ -39,39 +23,27 @@ func (Domain) Info() kit.DomainInfo {
 			Short:  "A command line for IP geolocation via ipinfo.io.",
 			Long: `A command line for IP geolocation via ipinfo.io.
 
-ipinfo reads public ipinfo data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+ipinfo looks up IP addresses against ipinfo.io over HTTPS, shapes the response
+into clean records, and prints output that pipes into the rest of your tools.
+No API key required for the basic tier (50k lookups/month).`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/ipinfo-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `ipinfo page` and
-	// `ant get ipinfo://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
-
-	// List op: members of a page, the home of `ipinfo links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// ipinfo://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "lookup", Group: "read", Single: true,
+		Summary: "Look up an IP address (omit to look up your own IP)",
+		Args:    []kit.Arg{{Name: "ip", Help: "IP address to look up (optional; omit for your own IP)", Optional: true}}}, lookupIP)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the Client from kit config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +54,46 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
-
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+// lookupInput is the input for the lookup operation.
+type lookupInput struct {
+	IP     string  `kit:"arg" help:"IP address to look up (optional; omit for your own IP)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
-}
-
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+// lookupIP handles the lookup operation. If IP is empty, it looks up the
+// caller's own IP via /json; otherwise it calls /{ip}/json.
+func lookupIP(ctx context.Context, in lookupInput, emit func(*IPInfo) error) error {
+	var (
+		info *IPInfo
+		err  error
+	)
+	if in.IP == "" {
+		info, err = in.Client.Me(ctx)
+	} else {
+		info, err = in.Client.LookupIP(ctx, in.IP)
+	}
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
+	return emit(info)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
-			return err
-		}
-	}
-	return nil
+// Classify turns an IP address into (type, id).
+func (Domain) Classify(input string) (string, string, error) {
+	return "ip", input, nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full ipinfo.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized ipinfo reference: %q", input)
+// Locate returns the live https URL for a (type, id).
+func (Domain) Locate(t, id string) (string, error) {
+	switch t {
+	case "ip":
+		return fmt.Sprintf("https://ipinfo.io/%s", id), nil
+	default:
+		return "", errs.Usage("ipinfo has no resource type %q", t)
 	}
-	return "page", id, nil
-}
-
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("ipinfo has no resource type %q", uriType)
-	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
