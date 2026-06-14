@@ -33,8 +33,8 @@ type IPInfo struct {
 	City     string `json:"city"`
 	Region   string `json:"region"`
 	Country  string `json:"country"`
-	Lat      string `json:"lat"`      // first part of loc ("lat,lon")
-	Lon      string `json:"lon"`      // second part of loc ("lat,lon")
+	Lat      string `json:"lat"` // first part of loc ("lat,lon")
+	Lon      string `json:"lon"` // second part of loc ("lat,lon")
 	Org      string `json:"org"`
 	Postal   string `json:"postal"`
 	Timezone string `json:"timezone"`
